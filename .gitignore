@@ -1,0 +1,4 @@
+node_modules/
+metropark.db
+*.exe
+tempCodeRunnerFile.js

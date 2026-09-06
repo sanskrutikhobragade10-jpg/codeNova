@@ -5,6 +5,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const url = require('url');
+const Database = require('better-sqlite3');
 
 const PORT = process.env.PORT || 3000;
 const FRONTEND_DIR = path.join(__dirname, 'frontend', 'smart-parking-system');
@@ -20,15 +21,47 @@ const METROPARK_CONFIG = {
     defaultParkingOpenTime: '05:30',
     defaultParkingCloseTime: '23:30'
 };
+const db = new Database('metropark.db');
+
+db.exec(`
+    CREATE TABLE IF NOT EXISTS bookings (
+        bookingId TEXT PRIMARY KEY,
+        stationId TEXT NOT NULL,
+        stationName TEXT NOT NULL,
+        parkingId TEXT NOT NULL,
+        parkingName TEXT NOT NULL,
+        slotNumber TEXT NOT NULL,
+        reservedAt TEXT NOT NULL,
+        expiresAt TEXT NOT NULL,
+        status TEXT NOT NULL,
+        checkedInAt TEXT,
+        checkedOutAt TEXT,
+        parkingDurationMinutes INTEGER
+    )
+`);
 
 // Station and Parking Dataset (Initial state matching C++ backend)
 const stationData = {
     'sitabuldi': {
         name: 'Sitabuldi Interchange',
+        metroOpenTime: '06:00',
+        metroCloseTime: '23:00',
+        parkingOpenTime: '05:30',
+        parkingCloseTime: '23:30',
         latitude: 21.14152,
         longitude: 79.08315,
         parkings: [
-            { id: 'A', name: 'Munje Square Concourse', totalSlots: 50, availableSlots: 14, distance: 120 },
+            {
+    id: 'A',
+    name: 'Munje Square Concourse',
+    totalSlots: 50,
+    availableSlots: 14,
+    distance: 120,
+    entrance: 'Gate 1',
+    zone: 'Zone A',
+    floor: 'Ground Floor',
+    row: 'Row 1'
+},
             { id: 'B', name: 'Tekdi Road Parking Bay', totalSlots: 60, availableSlots: 35, distance: 230 },
             { id: 'C', name: 'Buty Plaza South Lot', totalSlots: 45, availableSlots: 28, distance: 380 }
         ]
@@ -349,8 +382,53 @@ Object.values(stationData).forEach(station => {
 
 // In-Memory Bookings Store
 let bookingCounter = 1001;
-const activeBookings = [];
 
+const lastBooking = db
+    .prepare('SELECT bookingId FROM bookings ORDER BY rowid DESC LIMIT 1')
+    .get();
+
+if (lastBooking) {
+    bookingCounter = parseInt(lastBooking.bookingId.replace('MP', '')) + 1;
+}
+const activeBookings = db
+    .prepare('SELECT * FROM bookings')
+    .all()
+    .map(booking => ({
+        ...booking,
+        entryQrToken: booking.bookingId,
+        exitQrToken: booking.bookingId + '-EXIT',
+        expiresAtTimestamp: new Date(booking.expiresAt).getTime()
+    }));
+const userProfile = {
+    usualStation: 'sitabuldi',
+    usualHour: 14
+};
+
+function expireBookings() {
+    const now = Date.now();
+
+    activeBookings.forEach(booking => {
+        if (booking.status === 'ACTIVE' && booking.expiresAtTimestamp <= now) {
+            booking.status = 'EXPIRED';
+
+            const station = stationData[booking.stationId];
+
+            if (station) {
+                const parking = station.parkings.find(
+                    p => p.id === booking.parkingId
+                );
+
+                if (parking) {
+                    parking.availableSlots = Math.min(
+                        parking.totalSlots,
+                        parking.availableSlots + 1
+                    );
+                }
+            }
+        }
+    });
+}
+setInterval(expireBookings, 1000);
 // ================= C++ CORE ALGORITHMS =================
 
 // 1. Demand Prediction (Matches C++ predictDemand)
@@ -380,6 +458,29 @@ function predictDemand(hour) {
     return {
         level: 'Low',
         score: 25
+    };
+}
+function getRushAlert(station, usualHour) {
+    const currentHour = new Date().getHours();
+
+    const currentDemand = predictDemand(currentHour)
+    const usualDemand = predictDemand(usualHour);
+   
+    
+
+    if (
+        currentDemand.score > usualDemand.score &&
+        currentDemand.score >= 80
+    ) {
+        return {
+            alert: true,
+            message: `Higher rush than usual at ${station.name}`
+        };
+    }
+
+    return {
+        alert: false,
+        message: 'No unusual rush detected'
     };
 }
 
@@ -446,6 +547,95 @@ function computeSmartScores(parkings, currentHour) {
 }
 
 // ================= HTTP SERVER & ROUTER =================
+function getStationTimingStatus(station) {
+    const now = new Date();
+
+    const currentMinutes =
+        now.getHours() * 60 + now.getMinutes();
+
+    const metroOpenTime = station.metroOpenTime || METROPARK_CONFIG.defaultMetroOpenTime;
+    const metroCloseTime = station.metroCloseTime || METROPARK_CONFIG.defaultMetroCloseTime;
+
+    const [openHour, openMinute] = metroOpenTime.split(':').map(Number);
+    const [closeHour, closeMinute] = metroCloseTime.split(':').map(Number);
+    const openMinutes = openHour * 60 + openMinute;
+    const closeMinutes = closeHour * 60 + closeMinute;
+
+    if (currentMinutes < openMinutes) {
+        return {
+            status: 'CLOSED',
+            message: `Metro opens at ${metroOpenTime}`
+        };
+    }
+
+    if (currentMinutes >= closeMinutes) {
+        return {
+            status: 'CLOSED',
+            message: 'Metro is currently closed'
+        };
+    }
+
+    const minutesUntilClose = closeMinutes - currentMinutes;
+
+    if (minutesUntilClose <= 30) {
+        return {
+            status: 'CLOSING_SOON',
+            minutesUntilClose,
+            message: `Metro closes in ${minutesUntilClose} minutes`
+        };
+    }
+
+    return {
+        status: 'OPEN',
+        minutesUntilClose
+    };
+}
+
+function getParkingGuidance(parking) {
+    const guidanceMap = {
+        A: {
+            entrance: 'Gate 1',
+            zone: 'Zone A',
+            floor: 'Ground Floor',
+            row: 'Row 1'
+        },
+        B: {
+            entrance: 'Gate 2',
+            zone: 'Zone B',
+            floor: 'Ground Floor',
+            row: 'Row 2'
+        },
+        C: {
+            entrance: 'Gate 3',
+            zone: 'Zone C',
+            floor: 'Ground Floor',
+            row: 'Row 3'
+        }
+    };
+
+    return guidanceMap[parking.id] || {
+        entrance: 'Main Gate',
+        zone: 'General Zone',
+        floor: 'Ground Floor',
+        row: 'Main Row'
+    };
+}
+
+
+function calculateRecommendationScore(distance, availableSlots, demandScore) {
+    const distanceScore = Math.max(0, 100 - (distance * 10));
+    const availabilityScore = Math.min(100, availableSlots);
+
+    return Number(
+        (
+            distanceScore * 0.4 +
+            availabilityScore * 0.3 +
+            (100 - demandScore) * 0.3
+        ).toFixed(2)
+    );
+}
+
+
 
 const server = http.createServer((req, res) => {
     const parsedUrl = url.parse(req.url, true);
@@ -499,52 +689,8 @@ const server = http.createServer((req, res) => {
     return R * c;
 }
 
-function predictDemand(hour) {
-    if (hour >= 8 && hour <= 10) {
-        return {
-            level: 'High',
-            score: 80
-        };
-    }
+    
 
-    if (hour >= 17 && hour <= 20) {
-        return {
-            level: 'High',
-            score: 85
-        };
-    }
-
-    if (hour >= 11 && hour <= 16) {
-        return {
-            level: 'Medium',
-            score: 55
-        };
-    }
-
-    return {
-        level: 'Low',
-        score: 25
-    };
-
-    function predictDemand(hour) {
-    // your prediction code
-}
-
-function calculateRecommendationScore(distance, availableSlots, demandScore) {
-    const distanceScore = Math.max(0, 100 - (distance * 10));
-    const availabilityScore = Math.min(100, availableSlots);
-
-    return Number(
-        (
-            distanceScore * 0.4 +
-            availabilityScore * 0.3 +
-            (100 - demandScore) * 0.3
-        ).toFixed(2)
-    );
-}
-
-// ---------- API ENDPOINTS ----------
-}
 
     // ---------- API ENDPOINTS ----------
 
@@ -555,6 +701,34 @@ if (pathname === '/api/cities' && method === 'GET') {
     )];
 
     return sendJSON(200, { cities });
+}
+
+// Personalized Rush Alert API
+if (pathname === '/api/rush-alert' && method === 'GET') {
+    const stationId = userProfile.usualStation;
+    const usualHour = userProfile.usualHour;
+
+    const station = stationData[stationId];
+
+    if (!station) {
+        return sendJSON(404, {
+            error: 'Station not found'
+        });
+    }
+
+    if (isNaN(usualHour) || usualHour < 0 || usualHour > 23) {
+        return sendJSON(400, {
+            error: 'Valid usualHour (0-23) is required'
+        });
+    }
+
+    const rushAlert = getRushAlert(station, usualHour);
+
+    return sendJSON(200, {
+        station: station.name,
+        usualHour,
+        ...rushAlert
+    });
 }
 
     
@@ -584,6 +758,16 @@ if (pathname === '/api/nearest-station' && method === 'GET') {
             );
             const currentHour = new Date().getHours();
             const demandPrediction = predictDemand(currentHour);
+            const smartScore = calculateRecommendationScore(
+    calculateDistance(
+        lat,
+        lon,
+        station.latitude,
+        station.longitude
+    ),
+    totalAvailableSlots,
+    demandPrediction.score
+);
 
             return {
                 id,
@@ -600,15 +784,28 @@ if (pathname === '/api/nearest-station' && method === 'GET') {
                 availableSlots: totalAvailableSlots,
                 demandLevel: demandPrediction.level,
                 demandScore: demandPrediction.score,
+                smartScore,
+                timing: getStationTimingStatus(station)
             };
             
         })
         .sort((a, b) => a.distance - b.distance);
 
     // Find nearest station that has at least one slot
-    const recommendedStation = nearbyStations.find(
-        station => station.availableSlots > 0
+           const recommendedStation = nearbyStations
+    .filter(
+        station =>
+            station.availableSlots > 0 &&
+            station.timing.status !== 'CLOSED'
+    )
+    .reduce(
+        (best, station) =>
+            !best || station.smartScore > best.smartScore
+                ? station
+                : best,
+        null
     );
+
 
     return sendJSON(200, {
         userLocation: {
@@ -639,8 +836,91 @@ if (pathname === '/api/nearest-station' && method === 'GET') {
             parkings: computedParkings
         });
     }
+    if (pathname === '/api/navigation' && method === 'GET') {
+    const stationId = parsedUrl.query.station;
+    const station = stationData[stationId];
 
-    // 3. POST /api/reserve
+    if (!station) {
+        return sendJSON(404, {
+            error: 'Station not found'
+        });
+    }
+
+    const navigationUrl =
+        `https://www.google.com/maps/dir/?api=1&destination=${station.latitude},${station.longitude}`;
+
+    return sendJSON(200, {
+        station: station.name,
+        latitude: station.latitude,
+        longitude: station.longitude,
+        navigationUrl
+    });
+}
+
+if (pathname === '/api/sensor-update' && method === 'POST') {
+    return readBody((data) => {
+        const { stationId, parkingId, availableSlots } = data;
+
+        const station = stationData[stationId];
+
+        if (!station) {
+            return sendJSON(404, { error: 'Station not found' });
+        }
+
+        const parking = station.parkings.find(
+            p => p.id === parkingId
+        );
+
+        if (!parking) {
+            return sendJSON(404, { error: 'Parking area not found' });
+        }
+
+        if (
+            typeof availableSlots !== 'number' ||
+            availableSlots < 0 ||
+            availableSlots > parking.totalSlots
+        ) {
+            return sendJSON(400, {
+                error: 'Invalid available slot count'
+            });
+        }
+
+        parking.availableSlots = availableSlots;
+
+        return sendJSON(200, {
+            success: true,
+            message: 'Parking sensor data updated',
+            stationId,
+            parkingId,
+            availableSlots
+        });
+    });
+}
+
+if (pathname === '/api/history' && method === 'GET') {
+    const history = db
+        .prepare(`
+            SELECT
+                bookingId,
+                stationName,
+                parkingName,
+                slotNumber,
+                reservedAt,
+                status,
+                checkedInAt,
+                checkedOutAt,
+                parkingDurationMinutes
+            FROM bookings
+            ORDER BY rowid DESC
+        `)
+        .all();
+
+    return sendJSON(200, {
+        success: true,
+        history
+    });
+}
+    // api reserve
     if (pathname === '/api/reserve' && method === 'POST') {
         return readBody((data) => {
             const { stationId, parkingId, slotNumber } = data;
@@ -658,14 +938,59 @@ if (pathname === '/api/nearest-station' && method === 'GET') {
             parking.availableSlots--;
 
             const bookingId = 'MP' + (bookingCounter++);
-            const assignedSlot = slotNumber || `${parking.id}-${String(parking.totalSlots - parking.availableSlots).padStart(2, '0')}`;
-            const expirationTime = Date.now() + (15 * 60 * 1000); // 15 minute temporary hold
+            let assignedSlot = slotNumber;
+
+            if (assignedSlot) {
+    const alreadyBooked = activeBookings.some(
+        booking =>
+            booking.stationId === stationId &&
+            booking.parkingId === parkingId &&
+            booking.slotNumber === assignedSlot &&
+            booking.status === 'ACTIVE' &&
+            booking.expiresAtTimestamp > Date.now()
+    );
+
+    if (alreadyBooked) {
+        return sendJSON(409, {
+            error: 'This parking slot is already booked.'
+        });
+    }
+}
+
+if (!assignedSlot) {
+    for (let i = 1; i <= parking.totalSlots; i++) {
+        const candidateSlot = `${parking.id}-${String(i).padStart(2, '0')}`;
+
+        const alreadyBooked = activeBookings.some(
+            booking =>
+                booking.stationId === stationId &&
+                booking.parkingId === parkingId &&
+                booking.slotNumber === candidateSlot &&
+                booking.status === 'ACTIVE' &&
+                booking.expiresAtTimestamp > Date.now()
+        );
+
+        if (!alreadyBooked) {
+            assignedSlot = candidateSlot;
+            break;
+        }
+    }
+}
+if (!assignedSlot) {
+    return sendJSON(409, {
+        error: 'No parking slot could be assigned. Please try again.'
+    });
+}
+            const expirationTime = Date.now() + (15*60* 1000); // 15 minute temporary hold
             const newBooking = {
                 bookingId,
+                entryQrToken: bookingId,
+                exitQrToken: bookingId + '-EXIT',
                 stationId,
                 stationName: station.name,
                 parkingId: parking.id,
                 parkingName: parking.name,
+                guidance: getParkingGuidance(parking),
                 distance: parking.distance,
                 slotNumber: assignedSlot,
                 reservedAt: new Date().toISOString(),
@@ -675,6 +1000,30 @@ if (pathname === '/api/nearest-station' && method === 'GET') {
             };
 
             activeBookings.push(newBooking);
+            db.prepare(`
+    INSERT INTO bookings (
+        bookingId,
+        stationId,
+        stationName,
+        parkingId,
+        parkingName,
+        slotNumber,
+        reservedAt,
+        expiresAt,
+        status
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+`).run(
+    newBooking.bookingId,
+    newBooking.stationId,
+    newBooking.stationName,
+    newBooking.parkingId,
+    newBooking.parkingName,
+    newBooking.slotNumber,
+    newBooking.reservedAt,
+    newBooking.expiresAt,
+    newBooking.status
+);
 
             return sendJSON(201, {
                 success: true,
@@ -684,6 +1033,122 @@ if (pathname === '/api/nearest-station' && method === 'GET') {
             });
         });
     }
+    // 4. POST /api/check-in
+if (pathname === '/api/check-in' && method === 'POST') {
+    return readBody((data) => {
+        const { qrToken } = data;
+
+        const booking = activeBookings.find(
+            booking => booking.entryQrToken === qrToken
+        );
+
+        if (!booking) {
+            return sendJSON(404, {
+                error: 'Invalid QR code or booking not found'
+            });
+        }
+
+        if (booking.status !== 'ACTIVE') {
+            return sendJSON(400, {
+                error: 'Booking is not active'
+            });
+        }
+
+        if (booking.expiresAtTimestamp <= Date.now()) {
+            expireBookings();
+
+            return sendJSON(400, {
+                error: 'Booking has expired'
+            });
+        }
+
+        booking.status = 'CHECKED_IN';
+booking.checkedInAt = new Date().toISOString();
+
+db.prepare(`
+    UPDATE bookings
+    SET status = ?, checkedInAt = ?
+    WHERE bookingId = ?
+`).run(
+    booking.status,
+    booking.checkedInAt,
+    booking.bookingId
+);
+
+        return sendJSON(200, {
+            success: true,
+            message: 'Entry verified successfully. Welcome to MetroPark!',
+            booking
+        });
+    });
+}
+// 5. POST /api/check-out
+if (pathname === '/api/check-out' && method === 'POST') {
+    return readBody((data) => {
+        const { qrToken } = data;
+
+        const booking = activeBookings.find(
+            booking => booking.exitQrToken === qrToken
+        );
+
+        if (!booking) {
+            return sendJSON(404, {
+                error: 'Invalid Exit QR code or booking not found'
+            });
+        }
+
+        if (booking.status !== 'CHECKED_IN') {
+            return sendJSON(400, {
+                error: 'Vehicle is not currently parked'
+            });
+        }
+
+        booking.status = 'COMPLETED';
+booking.checkedOutAt = new Date().toISOString();
+
+const durationMinutes = Math.ceil(
+    (new Date(booking.checkedOutAt) - new Date(booking.checkedInAt)) / (1000 * 60)
+);
+
+booking.parkingDurationMinutes = durationMinutes;
+
+db.prepare(`
+    UPDATE bookings
+    SET status = ?, checkedOutAt = ?, parkingDurationMinutes = ?
+    WHERE bookingId = ?
+`).run(
+    booking.status,
+    booking.checkedOutAt,
+    booking.parkingDurationMinutes,
+    booking.bookingId
+);
+
+
+
+booking.parkingDurationMinutes = durationMinutes;
+
+        const station = stationData[booking.stationId];
+
+        if (station) {
+            const parking = station.parkings.find(
+                p => p.id === booking.parkingId
+            );
+
+            if (parking) {
+                parking.availableSlots = Math.min(
+                    parking.totalSlots,
+                    parking.availableSlots + 1
+                );
+            }
+        }
+
+        return sendJSON(200, {
+            success: true,
+            message: 'Exit verified successfully. Slot is now available.',
+            booking
+        });
+    });
+}
 
     // 4. GET /api/bookings
     if (pathname === '/api/bookings' && method === 'GET') {
